@@ -15,7 +15,7 @@ class MedicalVQA(nn.Module):
       clip_size = 512,
       embed_size = 768):
 
-    super().__init__()
+    super(MedicalVQA, self).__init__()
 
     self.mlp = MLP(
       sizes = [clip_size, 
@@ -37,83 +37,46 @@ class MedicalVQA(nn.Module):
     self.prefix_length = prefix_length
     self.embed_size = embed_size
     
-  
-  def forward(self, prefix, question_ids, answer_ids=None):
-    visual_prefix = self.mlp(prefix).view(-1, self.prefix_length, self.embed_size)
-
-    #process question tokens
-    question_embeds = self.gpt.transformer.wte(question_ids)
-    question_embeds = self.question_proj(question_embeds)
-
-    #combine outputs
-    inputs_embeds = torch.cat([
-      self.gpt.transformer.wte(torch.tensor([[self.tokenizer.bos_token_id]], device = prefix.device)),
-      question_embeds,
-      visual_prefix,
-      self.gpt.transformer.wte(torch.tensor([[self.tokenizer.eos_token_id]], device = prefix.device))
-    ], dim=1)
-
-    outputs = self.gpt(
-      inputs_embeds = inputs_embeds,
-      labels = answer_ids
+  def forward(self, prefix, tokens, mask, q_len, labels=None):
+    # 1. Project visual features
+    prefix_projections = self.clip_project(prefix).view(
+        -1, self.prefix_length, self.gpt_embedding_size
+    )
+    
+    # 2. Embed tokens (supports BioGPT and others)
+    embedding = (
+        self.gpt.transformer.embed_tokens(tokens) 
+        if self.gpttype == 'microsoft/biogpt' 
+        else self.gpt.transformer.wte(tokens)
+    )
+    
+    # 3. Vectorized visual token insertion
+    batch_indices = torch.arange(tokens.size(0)).unsqueeze(1)
+    token_indices = q_len.unsqueeze(1) + torch.arange(self.prefix_length, device=tokens.device)
+    embedding[batch_indices, token_indices] = prefix_projections
+    
+    # 4. GPT forward (training/inference)
+    return self.gpt(
+        inputs_embeds=embedding,
+        attention_mask=mask,
+        labels = labels
     )
 
-    return outputs
+  def generate(self, prefix, tokens, mask, q_len):
+    prefix_projections = self.clip_project(prefix.view(1, -1)).view(
+        1, self.prefix_length, self.gpt_embedding_size
+    )
+    if self.gpttype == 'microsoft/biogpt':
+        embeddings = self.gpt.transformer.embed_tokens(tokens)
+    else:
+        embeddings = self.gpt.transformer.wte(tokens)
+       # 3. Insert visual prefix after question
+    batch_indices = torch.arange(1, device=tokens.device).unsqueeze(1)
+    token_indices = (q_len.view(-1) + torch.arange(self.prefix_length, device=tokens.device)).unsqueeze(0)
+    embeddings[batch_indices, token_indices] = prefix_projections
 
-
-  def generate(
-    self, 
-    prefix, 
-    question_ids, 
-    max_length=50,
-    num_beams = 5,
-    temparature=1.0,
-    top_k = None,
-    top_p = None, 
-    answer_ids=None,
-    method ="beam", 
-    repetition_penalty=1.0):
-
-    visual_prefix = self.mlp(prefix).view(-1, self.prefix_length, self.embed_size)
-
-    question_embeds =  self.gpt.transformer.wte(question_ids)
-    question_embeds = self.question_proj(question_embeds)
-
-    #combine inputs with BOS/EOS tokens
-    batch_size = question_ids.shape[0]
-    bos_token = torch.tensor([[self.tokenizer.bos_token_id]], device=prefix.device)
-    eos_token = torch.tensor([[self.tokenizer.eos_token_id]], device=prefix.device)
-
-    inputs_embeds = torch.cat([
-      self.gpt.transformer.wte(bos_token).expand(batch_size, -1, -1),
-      question_embeds,
-      visual_prefix,
-      self.gpt.transformer.wte(eos_token).expanf(batch_size, -1, -1) 
-    ], dim=1)
-
-
-    # --Method-Specific Generation ---
-    if method in ['beam', 'greedy']:
-      generated_ids = self.gpt.generate(
-        inputs_embeds = inputs_embeds,
-        max_length = max_length,
-        bum_beams = num_beams if method == "beam" else 1,
-        temparature = temparature,
-        top_k = top_k,
-        top_p = top_p,
-        pad_token_id = self.tokenizer.eos_token_id
-      )
-
-    elif method == "custom_beam":
-      generated_ids = self.generate_beam(
-        inputs_embeds = inputs_embeds,
-        beam_size = num_beams,
-        max_length = max_length
-
-      )
-
-    return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-
+    return embeddings
+    
 
 
 
